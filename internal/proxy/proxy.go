@@ -17,7 +17,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// --- 資料庫模型定義 ---
+// --- Database Model Definitions ---
 type GatewayRoute struct {
 	gorm.Model
 	Prefix string `gorm:"uniqueIndex"`
@@ -30,7 +30,7 @@ type ClientKey struct {
 	Owner   string
 }
 
-// Engine 網關核心引擎
+// Engine encapsulates database and memory state
 type Engine struct {
 	DB           *gorm.DB
 	routeCache   map[string][]string
@@ -55,7 +55,7 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.ResponseWriter.WriteHeader(code)
 }
 
-// NewEngine 初始化網關引擎
+// NewEngine initializes the gateway engine
 func NewEngine(db *gorm.DB) *Engine {
 	e := &Engine{
 		DB:           db,
@@ -70,7 +70,7 @@ func NewEngine(db *gorm.DB) *Engine {
 	return e
 }
 
-// ReloadRoutesCache 熱加載快取
+// ReloadRoutesCache hot-reloads the memory cache
 func (e *Engine) ReloadRoutesCache() {
 	e.cacheMutex.Lock()
 	defer e.cacheMutex.Unlock()
@@ -101,10 +101,10 @@ func (e *Engine) ReloadRoutesCache() {
 		return len(e.sortedKeys[i]) > len(e.sortedKeys[j])
 	})
 
-	log.Printf("🔄 [Engine] 路由快取熱加載完成。優先級: %v", e.sortedKeys)
+	log.Printf("🔄 [Engine] Route cache hot-reloaded. Order: %v", e.sortedKeys)
 }
 
-// WithLogging 訪問日誌與效能監控中間件
+// WithLogging handles auditing and latency metrics
 func (e *Engine) WithLogging(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -123,7 +123,7 @@ func (e *Engine) WithLogging(next http.HandlerFunc) http.HandlerFunc {
 		next(lrw, r)
 		latency := time.Since(startTime)
 
-		log.Printf("[📊 網關審計] %s │ %-6s │ %-3d │ %10v │ 入口路徑: %s",
+		log.Printf("[📊 AUDIT] %s │ %-6s │ %-3d │ %10v │ Path: %s",
 			startTime.Format("2006-01-02 15:04:05"),
 			r.Method,
 			lrw.statusCode,
@@ -133,7 +133,7 @@ func (e *Engine) WithLogging(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// WithCORS 跨網域處理中間件
+// WithCORS handles cross-origin configurations
 func (e *Engine) WithCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -148,7 +148,7 @@ func (e *Engine) WithCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// WithAuth 資安驗證中間件
+// WithAuth enforces dual-mode security checking
 func (e *Engine) WithAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/admin") {
@@ -166,14 +166,11 @@ func (e *Engine) WithAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		if tokenStr == "" {
-			http.Error(w, "🔒 Unauthorized: 缺少認證憑證", http.StatusUnauthorized)
+			http.Error(w, "🔒 Unauthorized: Missing credentials", http.StatusUnauthorized)
 			return
 		}
 
 		if strings.Count(tokenStr, ".") == 2 {
-			var jwtSecret = []byte("ncu-csie-secret-558")
-			_ = jwtSecret
-
 			token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 				if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 					return nil, jwt.ErrSignatureInvalid
@@ -184,30 +181,30 @@ func (e *Engine) WithAuth(next http.HandlerFunc) http.HandlerFunc {
 			if err == nil && token.Valid {
 				if claims, ok := token.Claims.(jwt.MapClaims); ok {
 					owner := claims["sub"].(string)
-					log.Printf("🔓 [JWT 驗證成功] 歡迎 JWT 用戶: %s", owner)
+					log.Printf("🔓 [JWT SUCCESS] Verified claims in-memory. User: %s", owner)
 					next(w, r)
 					return
 				}
 			}
 
-			log.Printf("🔒 [資安攔截] JWT 驗證失敗: %v", err)
-			http.Error(w, "🔒 Forbidden: JWT 簽章無效或已過期", http.StatusForbidden)
+			log.Printf("🔒 [AUTH DENIED] Invalid JWT signature: %v", err)
+			http.Error(w, "🔒 Forbidden: Invalid or expired JWT", http.StatusForbidden)
 			return
 		}
 
 		var clientKey ClientKey
 		if err := e.DB.Where("key_name = ?", tokenStr).First(&clientKey).Error; err != nil {
-			log.Printf("🔒 [資安攔截] 傳統 API Key 查無此人: %s", tokenStr)
-			http.Error(w, "🔒 Forbidden: 憑證無效", http.StatusForbidden)
+			log.Printf("🔒 [AUTH DENIED] API Key not found in DB: %s", tokenStr)
+			http.Error(w, "🔒 Forbidden: Invalid API Key", http.StatusForbidden)
 			return
 		}
 
-		log.Printf("🔓 [API Key 驗證成功] 歡迎老用戶: %s", clientKey.Owner)
+		log.Printf("🔓 [API KEY SUCCESS] Validated key from DB. User: %s", clientKey.Owner)
 		next(w, r)
 	}
 }
 
-// ProxyHandler 核心轉發與控制台路由分配
+// ProxyHandler maps routes and relays incoming traffic
 func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	currentPath := r.URL.Path
 
@@ -230,7 +227,7 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	e.cacheMutex.RUnlock()
 
 	if len(targets) == 0 {
-		http.Error(w, "🚫 Go-digiRunner: 未註冊該 API 路由", http.StatusNotFound)
+		http.Error(w, "🚫 Go-digiRunner: API Route Not Registered", http.StatusNotFound)
 		return
 	}
 
@@ -247,7 +244,7 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	targetServer, err := url.Parse(targetURLStr)
 	if err != nil {
-		http.Error(w, "網關內部錯誤", http.StatusInternalServerError)
+		http.Error(w, "Internal Gateway Error", http.StatusInternalServerError)
 		return
 	}
 
@@ -256,7 +253,7 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = "/"
 	}
 
-	log.Printf("[⚡️無痛轉發] %s -> %s%s", currentPath, targetURLStr, r.URL.Path)
+	log.Printf("[⚡️ Forwarding] %s -> %s%s", currentPath, targetURLStr, r.URL.Path)
 	proxy := httputil.NewSingleHostReverseProxy(targetServer)
 	r.Host = targetServer.Host
 
@@ -266,9 +263,8 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-// AdminHandler 後台 GUI 邏輯 (支援動態 Upsert 編輯)
+// AdminHandler serves the web UI for real-time upsert management
 func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. 處理表單提交 (新增 或 更新)
 	if r.Method == http.MethodPost {
 		idStr := r.FormValue("id")
 		prefix := r.FormValue("prefix")
@@ -280,26 +276,23 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if idStr != "" {
-				// 🚀 【更新邏輯】：如果帶有隱藏 ID，代表是編輯現有資料
 				var route GatewayRoute
 				if err := e.DB.First(&route, idStr).Error; err == nil {
 					route.Prefix = prefix
 					route.Target = target
 					e.DB.Save(&route)
-					log.Printf("✏️  [控制面] 成功修改路由規則 ID: %s (%s)", idStr, prefix)
+					log.Printf("✏️  [Control Plane] Updated route rule ID: %s (%s)", idStr, prefix)
 				}
 			} else {
-				// 🚀 【新增邏輯】：沒有 ID，建立新資料
 				e.DB.Create(&GatewayRoute{Prefix: prefix, Target: target})
-				log.Printf("➕ [控制面] 成功註冊新路由規則: %s", prefix)
+				log.Printf("➕ [Control Plane] Registered new route rule: %s", prefix)
 			}
-			e.ReloadRoutesCache() // 🔥 即時同步熱加載快取！
+			e.ReloadRoutesCache()
 		}
 		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 		return
 	}
 
-	// 2. 處理刪除路由
 	if strings.HasPrefix(r.URL.Path, "/admin/delete/") {
 		id := strings.TrimPrefix(r.URL.Path, "/admin/delete/")
 		e.DB.Delete(&GatewayRoute{}, id)
@@ -308,7 +301,6 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. 準備渲染網頁所需的資料結構
 	type DisplayRoute struct {
 		ID     uint
 		Prefix string
@@ -331,7 +323,6 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	e.metricsMutex.Unlock()
 
-	// 🔎 檢查網址有沒有帶 ?edit=ID
 	var editRoute GatewayRoute
 	isEditing := false
 	editID := r.URL.Query().Get("edit")
@@ -341,7 +332,6 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 封裝大包裹丟給前端 HTML
 	pageData := struct {
 		Routes    []DisplayRoute
 		EditRoute GatewayRoute
@@ -356,36 +346,35 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 	<!DOCTYPE html>
 	<html>
 	<head>
-		<title>Go-digiRunner 控制台</title>
+		<title>Go-digiRunner Admin Console</title>
 		<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 	</head>
 	<body class="bg-light">
 		<div class="container py-5">
 			<div class="d-flex justify-content-between align-items-center mb-4">
-				<h1 class="text-primary m-0">⚙️ Go-digiRunner 網關控制台</h1>
-				<span class="badge bg-success p-2">動態管理模組完全體</span>
+				<h1 class="text-primary m-0">⚙️ Go-digiRunner Gateway Console</h1>
 			</div>
 			
 			<div class="card mb-4 shadow-sm border-{{if .IsEditing}}warning{{else}}dark{{end}}">
 				<div class="card-header bg-{{if .IsEditing}}warning text-dark{{else}}dark text-white{{end}} fw-bold">
-					{{if .IsEditing}}✏️ 編輯微服務 API 路由表規則{{else}}➕ 註冊新微服務 API{{end}}
-					{{if .IsEditing}}<a href="/admin" class="btn btn-sm btn-secondary float-end">取消編輯</a>{{end}}
+					{{if .IsEditing}}✏️ Edit API Routing Rule{{else}}➕ Register New API Route{{end}}
+					{{if .IsEditing}}<a href="/admin" class="btn btn-sm btn-secondary float-end">Cancel</a>{{end}}
 				</div>
 				<div class="card-body">
 					<form method="POST" action="/admin" class="row g-3">
 						<input type="hidden" name="id" value="{{if .IsEditing}}{{.EditRoute.ID}}{{end}}">
 						
 						<div class="col-md-4">
-							<label class="form-label fw-bold">網關前綴 (Prefix)</label>
-							<input type="text" name="prefix" class="form-control" placeholder="如: /api" value="{{if .IsEditing}}{{.EditRoute.Prefix}}{{end}}" required>
+							<label class="form-label fw-bold">Gateway Path (Prefix)</label>
+							<input type="text" name="prefix" class="form-control" placeholder="e.g., /api" value="{{if .IsEditing}}{{.EditRoute.Prefix}}{{end}}" required>
 						</div>
 						<div class="col-md-6">
-							<label class="form-label fw-bold">真實後端目標 (多目標以半形逗號區隔)</label>
-							<input type="text" name="target" class="form-control" placeholder="如: http://127.0.0.1:8081, http://127.0.0.1:8082" value="{{if .IsEditing}}{{.EditRoute.Target}}{{end}}" required>
+							<label class="form-label fw-bold">Backend Targets (Separated by commas for load balancing)</label>
+							<input type="text" name="target" class="form-control" placeholder="e.g., http://127.0.0.1:8081, http://127.0.0.1:8082" value="{{if .IsEditing}}{{.EditRoute.Target}}{{end}}" required>
 						</div>
 						<div class="col-md-2 d-flex align-items-end">
 							<button type="submit" class="btn btn-{{if .IsEditing}}warning{{else}}success{{end}} w-100 fw-bold">
-								{{if .IsEditing}}儲存變更{{else}}即時上線{{end}}
+								{{if .IsEditing}}Save Changes{{else}}Deploy Live{{end}}
 							</button>
 						</div>
 					</form>
@@ -393,16 +382,16 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 			</div>
 
 			<div class="card shadow-sm">
-				<div class="card-header bg-secondary text-white fw-bold">📋 執行中 API 路由表 (最長前綴優先級排序)</div>
+				<div class="card-header bg-secondary text-white fw-bold">📋 Active API Routing Table (Longest Prefix Match First)</div>
 				<div class="card-body p-0">
 					<table class="table table-striped table-hover m-0 align-middle">
 						<thead class="table-dark">
 							<tr>
 								<th style="width: 8%">ID</th>
-								<th style="width: 25%">網關入口路徑 (Prefix)</th>
-								<th style="width: 40%">後端微服務目標 (Target URL)</th>
-								<th style="width: 12%">呼叫次數 (Hits)</th>
-								<th style="width: 15%">操作</th>
+								<th style="width: 25%">Gateway Prefix</th>
+								<th style="width: 40%">Backend Upstream Targets</th>
+								<th style="width: 12%">Request Hits</th>
+								<th style="width: 15%">Actions</th>
 							</tr>
 						</thead>
 						<tbody>
@@ -413,12 +402,12 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 								<td><small class="text-muted">{{.Target}}</small></td>
 								<td>
 									<span class="badge bg-{{if gt .Hits 0}}primary{{else}}secondary{{end}} fs-6">
-										{{.Hits}} 次呼叫
+										{{.Hits}} hits
 									</span>
 								</td>
 								<td>
-									<a href="/admin?edit={{.ID}}" class="btn btn-outline-warning btn-sm me-1">編輯</a>
-									<a href="/admin/delete/{{.ID}}" class="btn btn-outline-danger btn-sm">下線</a>
+									<a href="/admin?edit={{.ID}}" class="btn btn-outline-warning btn-sm me-1">Edit</a>
+									<a href="/admin/delete/{{.ID}}" class="btn btn-outline-danger btn-sm">Delete</a>
 								</td>
 							</tr>
 							{{end}}
@@ -438,7 +427,7 @@ func (e *Engine) initSeedData() {
 	var count int64
 	e.DB.Model(&GatewayRoute{}).Count(&count)
 	if count == 0 {
-		e.DB.Create(&GatewayRoute{Prefix: "/service-a", Target: "https://httpbin.org"})
+		e.DB.Create(&GatewayRoute{Prefix: "/service-a", Target: "https://jsonplaceholder.typicode.com"})
 		e.DB.Create(&GatewayRoute{Prefix: "/service-b", Target: "https://api.github.com"})
 	}
 	e.DB.Model(&ClientKey{}).Count(&count)
@@ -447,7 +436,7 @@ func (e *Engine) initSeedData() {
 	}
 }
 
-// WithRateLimit 流量限制中間件
+// WithRateLimit enforces sliding/bucket throttling policies
 func (e *Engine) WithRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/admin") {
@@ -469,8 +458,8 @@ func (e *Engine) WithRateLimit(next http.HandlerFunc) http.HandlerFunc {
 		e.limiterMutex.Unlock()
 
 		if !limiter.Allow() {
-			log.Printf("⚠️  [流量控制] 惡意刷流量連線遭攔截！拒絕 IP: %s", ip)
-			http.Error(w, "🛑 Too Many Requests: 您呼叫得太頻繁了，請稍後再試 (429)", http.StatusTooManyRequests)
+			log.Printf("⚠️  [RATE LIMIT] Throttling connection from IP: %s", ip)
+			http.Error(w, "🛑 Too Many Requests: Rate limit exceeded (429)", http.StatusTooManyRequests)
 			return
 		}
 
