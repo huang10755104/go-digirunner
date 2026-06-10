@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 )
 
@@ -34,6 +35,9 @@ type Engine struct {
 	cacheMutex   sync.RWMutex
 	metrics      map[string]int
 	metricsMutex sync.Mutex
+
+	ipLimiters   map[string]*rate.Limiter
+	limiterMutex sync.Mutex
 }
 
 // NewEngine 初始化網關引擎
@@ -42,6 +46,7 @@ func NewEngine(db *gorm.DB) *Engine {
 		DB:         db,
 		routeCache: make(map[string]string),
 		metrics:    make(map[string]int),
+		ipLimiters: make(map[string]*rate.Limiter),
 	}
 	// 自動遷移
 	e.DB.AutoMigrate(&GatewayRoute{}, &ClientKey{})
@@ -299,5 +304,41 @@ func (e *Engine) initSeedData() {
 	e.DB.Model(&ClientKey{}).Count(&count)
 	if count == 0 {
 		e.DB.Create(&ClientKey{KeyName: "admin-pass-558", Owner: "NCU_CSIE_Admin"})
+	}
+}
+
+// WithRateLimit 流量限制中間件 (防止用戶惡意刷 API)
+func (e *Engine) WithRateLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 放行管理後台
+		if strings.HasPrefix(r.URL.Path, "/admin") {
+			next(w, r)
+			return
+		}
+
+		// 1. 取得客戶端的真實 IP 地址 (切除 Port 部分)
+		ip := strings.Split(r.RemoteAddr, ":")[0]
+
+		e.limiterMutex.Lock()
+		limiter, exists := e.ipLimiters[ip]
+		if !exists {
+			// 💡 建立新限制器：
+			// rate.Limit(2) 代表每秒「穩定生成 2 個權杖」（每秒只能戳 2 下）
+			// 3 代表「水桶總容量」，允許瞬間爆發連點 3 下（Burst）
+			limiter = rate.NewLimiter(2, 3)
+			e.ipLimiters[ip] = limiter
+		}
+		e.limiterMutex.Unlock()
+
+		// 2. 檢查水桶裡還有沒有權杖可拿
+		if !limiter.Allow() {
+			log.Printf("⚠️  [流量控制] 惡意刷流量連線遭攔截！拒絕 IP: %s", ip)
+			// 傳回標準的 429 狀態碼
+			http.Error(w, "🛑 Too Many Requests: 您呼叫得太頻繁了，請稍後再試 (429)", http.StatusTooManyRequests)
+			return
+		}
+
+		// 3. 還有權杖，順利通關，交給下一層
+		next(w, r)
 	}
 }
