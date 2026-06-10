@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
@@ -40,6 +41,15 @@ type Engine struct {
 
 	ipLimiters   map[string]*rate.Limiter
 	limiterMutex sync.Mutex
+}
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
 }
 
 // NewEngine 初始化網關引擎
@@ -92,6 +102,41 @@ func (e *Engine) ReloadRoutesCache() {
 	})
 
 	log.Printf("🔄 [Engine] 路由與負載平衡快取已熱加載。優先級: %v", e.sortedKeys)
+}
+
+// WithLogging 訪問日誌與效能監控中間件
+func (e *Engine) WithLogging(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 1. 紀錄請求進來的起點時間
+		startTime := time.Now()
+
+		// 放行管理後台，不印轉發日誌避免洗畫面
+		if strings.HasPrefix(r.URL.Path, "/admin") {
+			next(w, r)
+			return
+		}
+
+		// 2. 實例化我們的攔截器，預設狀態碼為 200
+		lrw := &loggingResponseWriter{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+		}
+
+		// 3. 把包裝後的 lrw 送進下一層（讓 httputil.ReverseProxy 往裡面寫資料）
+		next(lrw, r)
+
+		// 4. 當下一層全部執行完畢、流量轉發回來後，計算總耗時
+		latency := time.Since(startTime)
+
+		// 5. 印出漂亮的生產級訪問日誌 (Access Log)
+		log.Printf("[📊 網關審計] %s │ %-6s │ %-3d │ %10v │ 路徑: %s",
+			startTime.Format("2006-01-02 15:04:05"), // 時間
+			r.Method,                                // 方法 (GET/POST)
+			lrw.statusCode,                          // 最終狀態碼
+			latency,                                 // 網關總耗時
+			r.URL.Path,                              // 戳的路徑
+		)
+	}
 }
 
 // WithCORS 跨網域處理中間件
