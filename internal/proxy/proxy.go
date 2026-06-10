@@ -3,7 +3,7 @@ package proxy
 import (
 	"html/template"
 	"log"
-	"net" // 🚀 新增：用於安全解析網路位址
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -30,7 +30,7 @@ type ClientKey struct {
 	Owner   string
 }
 
-// Engine 網關核心引擎，封裝了所有資料庫與記憶體狀態
+// Engine 網關核心引擎
 type Engine struct {
 	DB           *gorm.DB
 	routeCache   map[string][]string
@@ -70,7 +70,7 @@ func NewEngine(db *gorm.DB) *Engine {
 	return e
 }
 
-// ReloadRoutesCache 熱加載快取（最長前綴匹配排序 + 負載平衡解析）
+// ReloadRoutesCache 熱加載快取
 func (e *Engine) ReloadRoutesCache() {
 	e.cacheMutex.Lock()
 	defer e.cacheMutex.Unlock()
@@ -101,15 +101,13 @@ func (e *Engine) ReloadRoutesCache() {
 		return len(e.sortedKeys[i]) > len(e.sortedKeys[j])
 	})
 
-	log.Printf("🔄 [Engine] 路由與負載平衡快取已熱加載。優先級: %v", e.sortedKeys)
+	log.Printf("🔄 [Engine] 路由快取熱加載完成。優先級: %v", e.sortedKeys)
 }
 
 // WithLogging 訪問日誌與效能監控中間件
 func (e *Engine) WithLogging(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
-
-		// 🚀 關鍵修復：在下層重寫路徑前，先將前端傳進來的「原始請求路徑」死死存住
 		originalPath := r.URL.Path
 
 		if strings.HasPrefix(originalPath, "/admin") {
@@ -123,10 +121,8 @@ func (e *Engine) WithLogging(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		next(lrw, r)
-
 		latency := time.Since(startTime)
 
-		// 🚀 關鍵修復：日誌審計一律印出 originalPath，確保看得到真實呼叫入口
 		log.Printf("[📊 網關審計] %s │ %-6s │ %-3d │ %10v │ 入口路徑: %s",
 			startTime.Format("2006-01-02 15:04:05"),
 			r.Method,
@@ -270,22 +266,40 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-// AdminHandler 後台 GUI 邏輯
+// AdminHandler 後台 GUI 邏輯 (支援動態 Upsert 編輯)
 func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. 處理表單提交 (新增 或 更新)
 	if r.Method == http.MethodPost {
+		idStr := r.FormValue("id")
 		prefix := r.FormValue("prefix")
 		target := r.FormValue("target")
+
 		if prefix != "" && target != "" {
 			if !strings.HasPrefix(prefix, "/") {
 				prefix = "/" + prefix
 			}
-			e.DB.Create(&GatewayRoute{Prefix: prefix, Target: target})
-			e.ReloadRoutesCache()
+
+			if idStr != "" {
+				// 🚀 【更新邏輯】：如果帶有隱藏 ID，代表是編輯現有資料
+				var route GatewayRoute
+				if err := e.DB.First(&route, idStr).Error; err == nil {
+					route.Prefix = prefix
+					route.Target = target
+					e.DB.Save(&route)
+					log.Printf("✏️  [控制面] 成功修改路由規則 ID: %s (%s)", idStr, prefix)
+				}
+			} else {
+				// 🚀 【新增邏輯】：沒有 ID，建立新資料
+				e.DB.Create(&GatewayRoute{Prefix: prefix, Target: target})
+				log.Printf("➕ [控制面] 成功註冊新路由規則: %s", prefix)
+			}
+			e.ReloadRoutesCache() // 🔥 即時同步熱加載快取！
 		}
 		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 		return
 	}
 
+	// 2. 處理刪除路由
 	if strings.HasPrefix(r.URL.Path, "/admin/delete/") {
 		id := strings.TrimPrefix(r.URL.Path, "/admin/delete/")
 		e.DB.Delete(&GatewayRoute{}, id)
@@ -294,15 +308,16 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var routes []GatewayRoute
-	e.DB.Find(&routes)
-
+	// 3. 準備渲染網頁所需的資料結構
 	type DisplayRoute struct {
 		ID     uint
 		Prefix string
 		Target string
 		Hits   int
 	}
+
+	var routes []GatewayRoute
+	e.DB.Find(&routes)
 
 	var displayList []DisplayRoute
 	e.metricsMutex.Lock()
@@ -316,6 +331,27 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	e.metricsMutex.Unlock()
 
+	// 🔎 檢查網址有沒有帶 ?edit=ID
+	var editRoute GatewayRoute
+	isEditing := false
+	editID := r.URL.Query().Get("edit")
+	if editID != "" {
+		if err := e.DB.First(&editRoute, editID).Error; err == nil {
+			isEditing = true
+		}
+	}
+
+	// 封裝大包裹丟給前端 HTML
+	pageData := struct {
+		Routes    []DisplayRoute
+		EditRoute GatewayRoute
+		IsEditing bool
+	}{
+		Routes:    displayList,
+		EditRoute: editRoute,
+		IsEditing: isEditing,
+	}
+
 	tmpl := `
 	<!DOCTYPE html>
 	<html>
@@ -327,21 +363,30 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 		<div class="container py-5">
 			<div class="d-flex justify-content-between align-items-center mb-4">
 				<h1 class="text-primary m-0">⚙️ Go-digiRunner 網關控制台</h1>
-				<span class="badge bg-success p-2">模組化架構完全體</span>
+				<span class="badge bg-success p-2">動態管理模組完全體</span>
 			</div>
 			
-			<div class="card mb-4 shadow-sm">
-				<div class="card-header bg-dark text-white fw-bold">➕ 註冊新微服務 API</div>
+			<div class="card mb-4 shadow-sm border-{{if .IsEditing}}warning{{else}}dark{{end}}">
+				<div class="card-header bg-{{if .IsEditing}}warning text-dark{{else}}dark text-white{{end}} fw-bold">
+					{{if .IsEditing}}✏️ 編輯微服務 API 路由表規則{{else}}➕ 註冊新微服務 API{{end}}
+					{{if .IsEditing}}<a href="/admin" class="btn btn-sm btn-secondary float-end">取消編輯</a>{{end}}
+				</div>
 				<div class="card-body">
 					<form method="POST" action="/admin" class="row g-3">
+						<input type="hidden" name="id" value="{{if .IsEditing}}{{.EditRoute.ID}}{{end}}">
+						
 						<div class="col-md-4">
-							<input type="text" name="prefix" class="form-control" placeholder="轉發前綴 (如: /api)" required>
+							<label class="form-label fw-bold">網關前綴 (Prefix)</label>
+							<input type="text" name="prefix" class="form-control" placeholder="如: /api" value="{{if .IsEditing}}{{.EditRoute.Prefix}}{{end}}" required>
 						</div>
 						<div class="col-md-6">
-							<input type="url" name="target" class="form-control" placeholder="真實後端服務位址 (如: http://127.0.0.1:8080)" required>
+							<label class="form-label fw-bold">真實後端目標 (多目標以半形逗號區隔)</label>
+							<input type="text" name="target" class="form-control" placeholder="如: http://127.0.0.1:8081, http://127.0.0.1:8082" value="{{if .IsEditing}}{{.EditRoute.Target}}{{end}}" required>
 						</div>
-						<div class="col-md-2">
-							<button type="submit" class="btn btn-success w-100 fw-bold">即時上線</button>
+						<div class="col-md-2 d-flex align-items-end">
+							<button type="submit" class="btn btn-{{if .IsEditing}}warning{{else}}success{{end}} w-100 fw-bold">
+								{{if .IsEditing}}儲存變更{{else}}即時上線{{end}}
+							</button>
 						</div>
 					</form>
 				</div>
@@ -354,24 +399,27 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 						<thead class="table-dark">
 							<tr>
 								<th style="width: 8%">ID</th>
-								<th style="width: 30%">網關入口路徑 (Prefix)</th>
+								<th style="width: 25%">網關入口路徑 (Prefix)</th>
 								<th style="width: 40%">後端微服務目標 (Target URL)</th>
 								<th style="width: 12%">呼叫次數 (Hits)</th>
-								<th style="width: 10%">操作</th>
+								<th style="width: 15%">操作</th>
 							</tr>
 						</thead>
 						<tbody>
-							{{range .}}
+							{{range .Routes}}
 							<tr>
 								<td>{{.ID}}</td>
 								<td><code>{{.Prefix}}</code></td>
-								<td><a href="{{.Target}}" target="_blank" class="text-decoration-none">{{.Target}}</a></td>
+								<td><small class="text-muted">{{.Target}}</small></td>
 								<td>
 									<span class="badge bg-{{if gt .Hits 0}}primary{{else}}secondary{{end}} fs-6">
 										{{.Hits}} 次呼叫
 									</span>
 								</td>
-								<td><a href="/admin/delete/{{.ID}}" class="btn btn-outline-danger btn-sm">下線</a></td>
+								<td>
+									<a href="/admin?edit={{.ID}}" class="btn btn-outline-warning btn-sm me-1">編輯</a>
+									<a href="/admin/delete/{{.ID}}" class="btn btn-outline-danger btn-sm">下線</a>
+								</td>
 							</tr>
 							{{end}}
 						</tbody>
@@ -383,7 +431,7 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 	</html>`
 
 	t, _ := template.New("admin").Parse(tmpl)
-	t.Execute(w, displayList)
+	t.Execute(w, pageData)
 }
 
 func (e *Engine) initSeedData() {
@@ -399,7 +447,7 @@ func (e *Engine) initSeedData() {
 	}
 }
 
-// WithRateLimit 流量限制中間件 (防止用戶惡意刷 API)
+// WithRateLimit 流量限制中間件
 func (e *Engine) WithRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/admin") {
@@ -407,10 +455,8 @@ func (e *Engine) WithRateLimit(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// 🚀 關鍵修復：使用 Go 官方標準庫安全拆分 Host 與 Port (完美相容 IPv4 與 IPv6 格式)
 		ip, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			// 降級防呆：萬一解析失敗，直接拿原本的字串頂替
 			ip = r.RemoteAddr
 		}
 
