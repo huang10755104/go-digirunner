@@ -3,6 +3,7 @@ package proxy
 import (
 	"html/template"
 	"log"
+	"net" // 🚀 新增：用於安全解析網路位址
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 )
@@ -42,6 +44,7 @@ type Engine struct {
 	ipLimiters   map[string]*rate.Limiter
 	limiterMutex sync.Mutex
 }
+
 type loggingResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -61,14 +64,12 @@ func NewEngine(db *gorm.DB) *Engine {
 		metrics:      make(map[string]int),
 		ipLimiters:   make(map[string]*rate.Limiter),
 	}
-	// 自動遷移
 	e.DB.AutoMigrate(&GatewayRoute{}, &ClientKey{})
 	e.initSeedData()
 	e.ReloadRoutesCache()
 	return e
 }
 
-// ReloadRoutesCache 熱加載快取（最長前綴匹配排序）
 // ReloadRoutesCache 熱加載快取（最長前綴匹配排序 + 負載平衡解析）
 func (e *Engine) ReloadRoutesCache() {
 	e.cacheMutex.Lock()
@@ -78,11 +79,10 @@ func (e *Engine) ReloadRoutesCache() {
 	e.DB.Find(&routes)
 
 	e.routeCache = make(map[string][]string)
-	e.routeIndexes = make(map[string]int) // 🔥 每次重新載入時重設輪詢索引
+	e.routeIndexes = make(map[string]int)
 	e.sortedKeys = []string{}
 
 	for _, r := range routes {
-		// 🚀 關鍵核心：用逗號切開多個後端網址
 		rawTargets := strings.Split(r.Target, ",")
 		var cleanTargets []string
 		for _, t := range rawTargets {
@@ -93,12 +93,12 @@ func (e *Engine) ReloadRoutesCache() {
 		}
 
 		e.routeCache[r.Prefix] = cleanTargets
-		e.routeIndexes[r.Prefix] = 0 // 從第 0 台機器開始輪詢
+		e.routeIndexes[r.Prefix] = 0
 		e.sortedKeys = append(e.sortedKeys, r.Prefix)
 	}
 
 	sort.Slice(e.sortedKeys, func(i, j int) bool {
-		return len(e.sortedKeys[i]) > len(e.sortedKeys[j])
+		return len(sortedKeys[i]) > len(sortedKeys[j])
 	})
 
 	log.Printf("🔄 [Engine] 路由與負載平衡快取已熱加載。優先級: %v", e.sortedKeys)
@@ -107,34 +107,32 @@ func (e *Engine) ReloadRoutesCache() {
 // WithLogging 訪問日誌與效能監控中間件
 func (e *Engine) WithLogging(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 1. 紀錄請求進來的起點時間
 		startTime := time.Now()
 
-		// 放行管理後台，不印轉發日誌避免洗畫面
-		if strings.HasPrefix(r.URL.Path, "/admin") {
+		// 🚀 關鍵修復：在下層重寫路徑前，先將前端傳進來的「原始請求路徑」死死存住
+		originalPath := r.URL.Path
+
+		if strings.HasPrefix(originalPath, "/admin") {
 			next(w, r)
 			return
 		}
 
-		// 2. 實例化我們的攔截器，預設狀態碼為 200
 		lrw := &loggingResponseWriter{
 			ResponseWriter: w,
 			statusCode:     http.StatusOK,
 		}
 
-		// 3. 把包裝後的 lrw 送進下一層（讓 httputil.ReverseProxy 往裡面寫資料）
 		next(lrw, r)
 
-		// 4. 當下一層全部執行完畢、流量轉發回來後，計算總耗時
 		latency := time.Since(startTime)
 
-		// 5. 印出漂亮的生產級訪問日誌 (Access Log)
-		log.Printf("[📊 網關審計] %s │ %-6s │ %-3d │ %10v │ 路徑: %s",
-			startTime.Format("2006-01-02 15:04:05"), // 時間
-			r.Method,                                // 方法 (GET/POST)
-			lrw.statusCode,                          // 最終狀態碼
-			latency,                                 // 網關總耗時
-			r.URL.Path,                              // 戳的路徑
+		// 🚀 關鍵修復：日誌審計一律印出 originalPath，確保看得到真實呼叫入口
+		log.Printf("[📊 網關審計] %s │ %-6s │ %-3d │ %10v │ 入口路徑: %s",
+			startTime.Format("2006-01-02 15:04:05"),
+			r.Method,
+			lrw.statusCode,
+			latency,
+			originalPath,
 		)
 	}
 }
@@ -162,26 +160,53 @@ func (e *Engine) WithAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		var apiKey string
+		var tokenStr string
 		authHeader := r.Header.Get("Authorization")
 		if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
-			apiKey = strings.TrimPrefix(authHeader, "Bearer ")
+			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+		if tokenStr == "" {
+			tokenStr = r.Header.Get("X-DigiRunner-Key")
 		}
 
-		if apiKey == "" {
-			apiKey = r.Header.Get("X-DigiRunner-Key")
+		if tokenStr == "" {
+			http.Error(w, "🔒 Unauthorized: 缺少認證憑證", http.StatusUnauthorized)
+			return
 		}
 
-		if apiKey == "" {
-			http.Error(w, "🔒 Unauthorized: 缺少相容之認證憑證", http.StatusUnauthorized)
+		if strings.Count(tokenStr, ".") == 2 {
+			var jwtSecret = []byte("ncu-csie-secret-558")
+			_ = jwtSecret
+
+			token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+				if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, jwt.ErrSignatureInvalid
+				}
+				return []byte("ncu-csie-secret-558"), nil
+			})
+
+			if err == nil && token.Valid {
+				if claims, ok := token.Claims.(jwt.MapClaims); ok {
+					owner := claims["sub"].(string)
+					log.Printf("🔓 [JWT 驗證成功] 歡迎 JWT 用戶: %s", owner)
+					next(w, r)
+					return
+				}
+			}
+
+			log.Printf("🔒 [資安攔截] JWT 驗證失敗: %v", err)
+			http.Error(w, "🔒 Forbidden: JWT 簽章無效或已過期", http.StatusForbidden)
 			return
 		}
 
 		var clientKey ClientKey
-		if err := e.DB.Where("key_name = ?", apiKey).First(&clientKey).Error; err != nil {
+		if err := e.DB.Where("key_name = ?", tokenStr).First(&clientKey).Error; err != nil {
+			log.Printf("🔒 [資安攔截] 傳統 API Key 查無此人: %s", tokenStr)
 			http.Error(w, "🔒 Forbidden: 憑證無效", http.StatusForbidden)
 			return
 		}
+
+		log.Printf("🔓 [API Key 驗證成功] 歡迎老用戶: %s", clientKey.Owner)
 		next(w, r)
 	}
 }
@@ -196,7 +221,7 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	e.cacheMutex.RLock()
-	var targets []string // 🚀 拿出來的是該路由所有的後端機器清單
+	var targets []string
 	var routePrefix string
 
 	for _, prefix := range e.sortedKeys {
@@ -208,22 +233,18 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	e.cacheMutex.RUnlock()
 
-	// 防呆：如果找不到或陣列是空的
 	if len(targets) == 0 {
 		http.Error(w, "🚫 Go-digiRunner: 未註冊該 API 路由", http.StatusNotFound)
 		return
 	}
 
-	// 🚀 【負載平衡演算法核心】
 	e.indexMutex.Lock()
 	currentIndex := e.routeIndexes[routePrefix]
-	targetURLStr := targets[currentIndex] // 🎯 決定這筆請求要送給哪一台機器！
+	targetURLStr := targets[currentIndex]
 
-	// 往下輪一個位置，如果到底了就透過取餘數 (%) 自動歸零
 	e.routeIndexes[routePrefix] = (currentIndex + 1) % len(targets)
 	e.indexMutex.Unlock()
 
-	// 📊 數據統計
 	e.metricsMutex.Lock()
 	e.metrics[routePrefix]++
 	e.metricsMutex.Unlock()
@@ -381,35 +402,32 @@ func (e *Engine) initSeedData() {
 // WithRateLimit 流量限制中間件 (防止用戶惡意刷 API)
 func (e *Engine) WithRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 放行管理後台
 		if strings.HasPrefix(r.URL.Path, "/admin") {
 			next(w, r)
 			return
 		}
 
-		// 1. 取得客戶端的真實 IP 地址 (切除 Port 部分)
-		ip := strings.Split(r.RemoteAddr, ":")[0]
+		// 🚀 關鍵修復：使用 Go 官方標準庫安全拆分 Host 與 Port (完美相容 IPv4 與 IPv6 格式)
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// 降級防呆：萬一解析失敗，直接拿原本的字串頂替
+			ip = r.RemoteAddr
+		}
 
 		e.limiterMutex.Lock()
 		limiter, exists := e.ipLimiters[ip]
 		if !exists {
-			// 💡 建立新限制器：
-			// rate.Limit(2) 代表每秒「穩定生成 2 個權杖」（每秒只能戳 2 下）
-			// 3 代表「水桶總容量」，允許瞬間爆發連點 3 下（Burst）
 			limiter = rate.NewLimiter(2, 3)
 			e.ipLimiters[ip] = limiter
 		}
 		e.limiterMutex.Unlock()
 
-		// 2. 檢查水桶裡還有沒有權杖可拿
 		if !limiter.Allow() {
 			log.Printf("⚠️  [流量控制] 惡意刷流量連線遭攔截！拒絕 IP: %s", ip)
-			// 傳回標準的 429 狀態碼
 			http.Error(w, "🛑 Too Many Requests: 您呼叫得太頻繁了，請稍後再試 (429)", http.StatusTooManyRequests)
 			return
 		}
 
-		// 3. 還有權杖，順利通關，交給下一層
 		next(w, r)
 	}
 }
