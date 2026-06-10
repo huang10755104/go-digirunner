@@ -30,7 +30,9 @@ type ClientKey struct {
 // Engine 網關核心引擎，封裝了所有資料庫與記憶體狀態
 type Engine struct {
 	DB           *gorm.DB
-	routeCache   map[string]string
+	routeCache   map[string][]string
+	routeIndexes map[string]int
+	indexMutex   sync.Mutex
 	sortedKeys   []string
 	cacheMutex   sync.RWMutex
 	metrics      map[string]int
@@ -43,10 +45,11 @@ type Engine struct {
 // NewEngine 初始化網關引擎
 func NewEngine(db *gorm.DB) *Engine {
 	e := &Engine{
-		DB:         db,
-		routeCache: make(map[string]string),
-		metrics:    make(map[string]int),
-		ipLimiters: make(map[string]*rate.Limiter),
+		DB:           db,
+		routeCache:   make(map[string][]string),
+		routeIndexes: make(map[string]int),
+		metrics:      make(map[string]int),
+		ipLimiters:   make(map[string]*rate.Limiter),
 	}
 	// 自動遷移
 	e.DB.AutoMigrate(&GatewayRoute{}, &ClientKey{})
@@ -56,6 +59,7 @@ func NewEngine(db *gorm.DB) *Engine {
 }
 
 // ReloadRoutesCache 熱加載快取（最長前綴匹配排序）
+// ReloadRoutesCache 熱加載快取（最長前綴匹配排序 + 負載平衡解析）
 func (e *Engine) ReloadRoutesCache() {
 	e.cacheMutex.Lock()
 	defer e.cacheMutex.Unlock()
@@ -63,11 +67,23 @@ func (e *Engine) ReloadRoutesCache() {
 	var routes []GatewayRoute
 	e.DB.Find(&routes)
 
-	e.routeCache = make(map[string]string)
+	e.routeCache = make(map[string][]string)
+	e.routeIndexes = make(map[string]int) // 🔥 每次重新載入時重設輪詢索引
 	e.sortedKeys = []string{}
 
 	for _, r := range routes {
-		e.routeCache[r.Prefix] = r.Target
+		// 🚀 關鍵核心：用逗號切開多個後端網址
+		rawTargets := strings.Split(r.Target, ",")
+		var cleanTargets []string
+		for _, t := range rawTargets {
+			trimmed := strings.TrimSpace(t)
+			if trimmed != "" {
+				cleanTargets = append(cleanTargets, trimmed)
+			}
+		}
+
+		e.routeCache[r.Prefix] = cleanTargets
+		e.routeIndexes[r.Prefix] = 0 // 從第 0 台機器開始輪詢
 		e.sortedKeys = append(e.sortedKeys, r.Prefix)
 	}
 
@@ -75,7 +91,7 @@ func (e *Engine) ReloadRoutesCache() {
 		return len(e.sortedKeys[i]) > len(e.sortedKeys[j])
 	})
 
-	log.Printf("🔄 [Engine] 路由快取熱加載完成。優先級: %v", e.sortedKeys)
+	log.Printf("🔄 [Engine] 路由與負載平衡快取已熱加載。優先級: %v", e.sortedKeys)
 }
 
 // WithCORS 跨網域處理中間件
@@ -135,23 +151,34 @@ func (e *Engine) ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	e.cacheMutex.RLock()
-	var targetURLStr string
+	var targets []string // 🚀 拿出來的是該路由所有的後端機器清單
 	var routePrefix string
 
 	for _, prefix := range e.sortedKeys {
 		if strings.HasPrefix(currentPath, prefix) {
 			routePrefix = prefix
-			targetURLStr = e.routeCache[prefix]
+			targets = e.routeCache[prefix]
 			break
 		}
 	}
 	e.cacheMutex.RUnlock()
 
-	if targetURLStr == "" {
+	// 防呆：如果找不到或陣列是空的
+	if len(targets) == 0 {
 		http.Error(w, "🚫 Go-digiRunner: 未註冊該 API 路由", http.StatusNotFound)
 		return
 	}
 
+	// 🚀 【負載平衡演算法核心】
+	e.indexMutex.Lock()
+	currentIndex := e.routeIndexes[routePrefix]
+	targetURLStr := targets[currentIndex] // 🎯 決定這筆請求要送給哪一台機器！
+
+	// 往下輪一個位置，如果到底了就透過取餘數 (%) 自動歸零
+	e.routeIndexes[routePrefix] = (currentIndex + 1) % len(targets)
+	e.indexMutex.Unlock()
+
+	// 📊 數據統計
 	e.metricsMutex.Lock()
 	e.metrics[routePrefix]++
 	e.metricsMutex.Unlock()
@@ -229,7 +256,6 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 	<head>
 		<title>Go-digiRunner 控制台</title>
 		<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-		<meta http-equiv="refresh" content="5">
 	</head>
 	<body class="bg-light">
 		<div class="container py-5">
