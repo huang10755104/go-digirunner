@@ -352,7 +352,7 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 	<body class="bg-light">
 		<div class="container py-5">
 			<div class="d-flex justify-content-between align-items-center mb-4">
-				<h1 class="text-primary m-0">⚙️ Go-digiRunner Gateway Console</h1>
+				<h1 class="text-primary m-0">Pinecone Runner Gateway Console</h1>
 			</div>
 			
 			<div class="card mb-4 shadow-sm border-{{if .IsEditing}}warning{{else}}dark{{end}}">
@@ -369,12 +369,12 @@ func (e *Engine) AdminHandler(w http.ResponseWriter, r *http.Request) {
 							<input type="text" name="prefix" class="form-control" placeholder="e.g., /api" value="{{if .IsEditing}}{{.EditRoute.Prefix}}{{end}}" required>
 						</div>
 						<div class="col-md-6">
-							<label class="form-label fw-bold">Backend Targets (Separated by commas for load balancing)</label>
+							<label class="form-label fw-bold">Backend Targets (Separated by " , " for load balancing)</label>
 							<input type="text" name="target" class="form-control" placeholder="e.g., http://127.0.0.1:8081, http://127.0.0.1:8082" value="{{if .IsEditing}}{{.EditRoute.Target}}{{end}}" required>
 						</div>
 						<div class="col-md-2 d-flex align-items-end">
 							<button type="submit" class="btn btn-{{if .IsEditing}}warning{{else}}success{{end}} w-100 fw-bold">
-								{{if .IsEditing}}Save Changes{{else}}Deploy Live{{end}}
+								{{if .IsEditing}}Save Changes{{else}}Deploy{{end}}
 							</button>
 						</div>
 					</form>
