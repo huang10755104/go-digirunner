@@ -98,7 +98,7 @@ func (e *Engine) ReloadRoutesCache() {
 	}
 
 	sort.Slice(e.sortedKeys, func(i, j int) bool {
-		return len(sortedKeys[i]) > len(sortedKeys[j])
+		return len(e.sortedKeys[i]) > len(e.sortedKeys[j])
 	})
 
 	log.Printf("🔄 [Engine] 路由與負載平衡快取已熱加載。優先級: %v", e.sortedKeys)
